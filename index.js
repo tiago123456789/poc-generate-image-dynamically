@@ -1,18 +1,47 @@
+require("dotenv").config()
 const express = require("express")
-const fs = require("fs");
 const crypto = require('crypto')
 const GenerateDynamicImage = require("./GenerateDynamicImage");
-const { getLastModification } = require("./FileUtil");
-const { getEtag, enableHTTPCache } = require("./CacheUtil");
+const { enableHTTPCache } = require("./CacheUtil");
 const { generateToken } = require("./HashUtil");
 const app = express();
+const AWS = require("aws-sdk")
+const multer = require('multer')
+const multerS3 = require('multer-s3')
+const { S3Client } = require('@aws-sdk/client-s3')
+
+var credentials = new AWS.SharedIniFileCredentials({ profile: process.env.PROFILE });
+
+const s3 = new S3Client({
+    credentials
+})
+
+const s3Client = new AWS.S3({
+    credentials
+})
 
 app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
+
+
+const upload = multer({
+    storage: multerS3({
+        s3: s3,
+        bucket: process.env.BUCKET,
+        metadata: function (req, file, cb) {
+            cb(null, { fieldName: file.fieldname });
+        },
+        key: function (req, file, cb) {
+            cb(null, file.originalname)
+        }
+    })
+})
 
 const extractDomain = (req) => {
-    return req.headers.referer
+    return (req.headers.referer || req.headers.host)
         .replace(/(http|https)/, "")
         .replace(/:\/\//, "")
+        .replace(/:([0-9])+$/, "")
         .replace(/:([0-9])+\/$/, "")
 }
 
@@ -26,6 +55,10 @@ const hasPermission = (req, res, next) => {
     return next();
 }
 
+app.post("/files", upload.single('file'), (req, res) => {
+    return res.json(req.file)
+})
+
 app.get("/token/generate", (req, res) => {
     const domain = extractDomain(req)
     const token = generateToken(domain)
@@ -33,6 +66,19 @@ app.get("/token/generate", (req, res) => {
         token
     })
 })
+
+const isExistFile = async (filename) => {
+    try {
+        const output = await s3Client.getObject({
+            Bucket: process.env.BUCKET,
+            Key: filename
+        }).promise();
+
+        return output.ETag
+    } catch (error) {
+        return false;
+    }
+}
 
 app.get("/:token/:filename", hasPermission, async (req, res, next) => {
     let hash;
@@ -48,21 +94,24 @@ app.get("/:token/:filename", hasPermission, async (req, res, next) => {
         .update(req.url.replace("/files/", ""))
         .digest("hex")
 
-    const pathFilename = `./files/cached/${fileHash}.${extension}`
-    const isExistFile = fs.existsSync(pathFilename);
+    const pathFilename = `cached/${fileHash}.${extension}`
+    const etagFile = await isExistFile(pathFilename);
 
     res.setHeader('Content-Type', 'image/png, image/jpeg, image/webp');
 
-    if (isExistFile) {
-        hash = getEtag(getLastModification(pathFilename))
+    if (etagFile) {
         const ifNoneMatch = req.headers['if-none-match']
-        if (hash == ifNoneMatch) {
+        if (etagFile == ifNoneMatch) {
             return res.sendStatus(304)
         }
     }
 
-    const generateDynamicImage = new GenerateDynamicImage(`./files/${req.params.filename}`)
+    const output = await s3Client.getObject({
+        Bucket: process.env.BUCKET,
+        Key: req.params.filename
+    }).promise()
 
+    const generateDynamicImage = new GenerateDynamicImage(output.Body)
     if (blur) generateDynamicImage.applyBur(blur);
     if (lightness) generateDynamicImage.applyLightness(lightness)
     if (width && heigth) generateDynamicImage.applyWidthHeight(
@@ -80,9 +129,13 @@ app.get("/:token/:filename", hasPermission, async (req, res, next) => {
     if (format && quality) generateDynamicImage.applyQuality(format, quality)
 
     const buffer = await generateDynamicImage.get();
-    await generateDynamicImage.save(pathFilename)
-    hash = getEtag(getLastModification(pathFilename))
-    enableHTTPCache(res, hash)
+    const saveFileOutput = await s3Client.putObject({
+        Bucket: process.env.BUCKET,
+        Key: pathFilename,
+        Body: buffer,
+        
+    }).promise()
+    enableHTTPCache(res, saveFileOutput.ETag)
     res.end(buffer)
 })
 

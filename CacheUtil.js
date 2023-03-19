@@ -5,7 +5,7 @@ const getEtag = (value) => {
 }
 
 const enableHTTPCache = (res, hash) => {
-    res.setHeader('Cache-Control', 'public, max-age=2');
+    res.setHeader('Cache-Control', 'public, max-age=10');
     res.setHeader('Etag', hash);
 }
 
